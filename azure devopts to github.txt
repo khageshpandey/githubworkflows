@@ -1,0 +1,14 @@
+Shell
+# Rename the old Azure DevOps remote
+git remote rename origin azure
+# Add the new GitHub remote as 'origin'
+git remote add origin https://github.com/civica/icasework.git
+# Verify remotes
+git remote -v
+# Fetch from GitHub
+git fetch origin
+# Set tracking for current branch (if needed)
+git branch --set-upstream-to=origin/main main
+# Reset Git LFS
+git lfs install
+git lfs pull

@@ -1,0 +1,111 @@
+# -----------------------------------------------------------------------------
+# Workflow: Build and Upload WAR for icasework
+#
+# Automates the process of building the iCasework WAR file using Maven.
+# Triggered on push, pull request, or manual dispatch on the `main` branch.
+# -----------------------------------------------------------------------------
+name: Build and Upload WAR
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+  # `workflow_dispatch` - Allows manual trigger of the workflow from the GitHub UI.
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          lfs: true
+        # "actions/checkout@v4" is the reusable GitHub Action from the marketplace.
+
+      # Set up Git LFS explicitly to be safe since we clone icasework-dependencies repo that uses LFS
+      - name: Initialize Git LFS
+        run: git lfs install
+
+      # Set up Java 21 & Maven
+      - name: Set up Java and Maven
+        uses: actions/setup-java@v3
+        with:
+          distribution: 'corretto'
+          java-version: '21'
+
+      # Clone private dependencies and install to local Maven repo
+      - name: Clone and install icasework-dependencies
+        env:
+          TOKEN: ${{ secrets.ICASEWORK_DEPENDENCIES_PAT }}
+        run: |
+          set -e
+          echo "Cloning icasework-dependencies repo..."
+          git clone https://x-access-token:${TOKEN}@github.com/civica/icasework-dependencies.git
+          cd icasework-dependencies
+          echo "Making install.sh executable..."
+          chmod +x install.sh
+          echo "Running install.sh..."
+          ./install.sh
+      # Note: The secrets.ICASEWORK_DEPENDENCIES_PAT is required to access the private dependency repo
+      # which is set to reset periodically, see GH task issue #520 for details on token rotation and reminders.
+      # Installing Git-crypt for decryption of ebextions folder
+      - name: Install git-crypt
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y git-crypt
+ 
+      - name: Decode and import git-crypt key
+        run: |
+          echo "${{ secrets.GIT_CRYPT_KEY }}" | base64 --decode > git-crypt-key
+          git-crypt unlock git-crypt-key
+      # Apply production.properties
+      - name: Recreate production.properties
+        run: |
+          echo "${{ secrets.PRODUCTION_PROPERTIES_B64 }}" | base64 --decode > src/main/filters/production.properties
+      # Build the Maven project without tests
+      - name: Build WAR
+        run: |
+          echo "Clean up `target/` from any previously compiled files and starting Maven build (skip tests)"
+          mvn -D skipTests -P production clean package
+         # Upload the generated WAR file as an artifact for use in the upload to S3 job
+      - name: Upload WAR artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: war
+          path: target/*.war
+
+      - name: Show workflow run and Git commit info
+        run: |
+          echo "Branch: ${{ github.ref }}, Run: ${{ github.run_number }}"
+          git log -1 --pretty=format:"Commit: %h%nAuthor: %an%nDate: %ad%nMessage: %s"
+
+  # Deploy war file in Elastic beanstalk inside aws data account devadmin-al23-0
+  # Note that devadmin-al23-0 is NOT managed by terraform
+  upload:
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+    # Download the WAR artifact that was created in the build job
+      - name: Download WAR artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: war
+          path: .
+
+      - name: Find and rename WAR file
+        run: |
+          WAR_FILE=$(find . -name "*.war" | head -n 1)
+          echo "Found WAR: $WAR_FILE"
+          mv "$WAR_FILE" icasework.war
+
+      - name: Deploy to Beanstalk
+        uses: einaregilsson/beanstalk-deploy@v21
+        with:
+          aws_access_key: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws_secret_key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          application_name: UAT iCasework
+          environment_name: devadmin-al23-0
+          region: eu-central-1
+          version_label: icasework-${{ github.run_number }}
+          deployment_package: icasework.war
